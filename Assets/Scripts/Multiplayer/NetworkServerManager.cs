@@ -25,6 +25,11 @@ using Utils;
 using Weapon;
 using Weapon.WeaponStats;
 using Random = UnityEngine.Random;
+#if UNITY_SERVER
+using SteamAuth = Steamworks.SteamGameServer;
+#else
+using SteamAuth = Steamworks.SteamUser;
+#endif
 
 namespace Multiplayer
 {
@@ -378,9 +383,20 @@ namespace Multiplayer
             }
         }
 
+        // The dedicated server never initializes the client Steam API (see SteamManager).
+#if UNITY_SERVER
+        static bool SteamReady => true;
+#else
+        static bool SteamReady => SteamManager.Initialized;
+#endif
+
+        public static ushort MinimalPlayerCount { get; set; } = 2;
+
+        public static bool DlcOnly { get; set; }
+
         private void Start()
         {
-            if (!SteamManager.Initialized)
+            if (!SteamReady)
             {
                 return;
             }
@@ -391,15 +407,19 @@ namespace Multiplayer
             RiptideLogger.Initialize(Debug.Log, true);
 #endif
 
+#if UNITY_SERVER
+            m_ValidateAuthTicketResponse = Callback<ValidateAuthTicketResponse_t>.CreateGameServer(OnValidateAuthTicketResponse);
+#else
             m_ValidateAuthTicketResponse = Callback<ValidateAuthTicketResponse_t>.Create(OnValidateAuthTicketResponse);
+#endif
 
             InitGame();
         }
 
         private void Update()
         {
-            if (!SteamManager.Initialized) return;
-            if (GameState == GameState.Voting && ClientData.Count >= CurrentServer.OverrideMinimalPlayerCount(2))
+            if (!SteamReady) return;
+            if (GameState == GameState.Voting && ClientData.Count >= CurrentServer.OverrideMinimalPlayerCount(MinimalPlayerCount))
             {
                 _votingTime -= Time.deltaTime;
 
@@ -412,7 +432,7 @@ namespace Multiplayer
 
         private void FixedUpdate()
         {
-            if (!SteamManager.Initialized) return;
+            if (!SteamReady) return;
 
             if (Server.IsRunning)
             {
@@ -463,7 +483,7 @@ namespace Multiplayer
         {
             foreach (var id in Authentication.SteamIds)
             {
-                SteamUser.EndAuthSession(new CSteamID(id));
+                SteamAuth.EndAuthSession(new CSteamID(id));
             }
             Authentication.Clear();
             Server.Stop();
@@ -607,7 +627,7 @@ namespace Multiplayer
 
                             msg.Add(_votingTime);
 
-                            msg.AddUShort(CurrentServer.OverrideMinimalPlayerCount(2));
+                            msg.AddUShort(CurrentServer.OverrideMinimalPlayerCount(MinimalPlayerCount));
 
                             msg.Add((ushort)ClientData.Count);
 
@@ -806,18 +826,23 @@ namespace Multiplayer
                 return;
             }
 
-            var result = SteamUser.BeginAuthSession(ticket, ticket.Length, id);
+            var result = SteamAuth.BeginAuthSession(ticket, ticket.Length, id);
 
             if (result == EBeginAuthSessionResult.k_EBeginAuthSessionResultDuplicateRequest)
             {
-                SteamUser.EndAuthSession(id);
-                result = SteamUser.BeginAuthSession(ticket, ticket.Length, id);
+                SteamAuth.EndAuthSession(id);
+                result = SteamAuth.BeginAuthSession(ticket, ticket.Length, id);
             }
 
             switch (result)
             {
                 case EBeginAuthSessionResult.k_EBeginAuthSessionResultOK:
-                    _userHasDlc[id.m_SteamID] = SteamUser.UserHasLicenseForApp(id, new AppId_t(2238100));
+                    _userHasDlc[id.m_SteamID] = SteamAuth.UserHasLicenseForApp(id, new AppId_t(2238100));
+                    if (DlcOnly && _userHasDlc[id.m_SteamID] != EUserHasLicenseForAppResult.k_EUserHasLicenseResultHasLicense)
+                    {
+                        Instance.Server.DisconnectClient(fromClient, GetDisconnectMessage("This server is DLC only"));
+                        return;
+                    }
                     Debug.Log($"Ticket is valid for this game 1949740 and this Steam ID {id}.");
                     return;
                 case EBeginAuthSessionResult.k_EBeginAuthSessionResultInvalidTicket:
@@ -975,7 +1000,7 @@ namespace Multiplayer
 
             if (Authentication.Remove(e.Client.Id, out var steamId))
             {
-                SteamUser.EndAuthSession(new CSteamID(steamId));
+                SteamAuth.EndAuthSession(new CSteamID(steamId));
                 _userHasDlc.Remove(steamId);
             }
 
@@ -1051,7 +1076,7 @@ namespace Multiplayer
 
         bool VerifyVote()
         {
-            if (ClientData.Count < CurrentServer.OverrideMinimalPlayerCount(2))
+            if (ClientData.Count < CurrentServer.OverrideMinimalPlayerCount(MinimalPlayerCount))
             {
                 return false;
             }
@@ -1275,6 +1300,10 @@ namespace Multiplayer
                 }
             }
             message.Release();
+
+#if UNITY_SERVER
+            Dedicated.DedicatedServer.Instance.LoadMap();
+#endif
         }
 
         public void StopGame()
@@ -1319,6 +1348,9 @@ namespace Multiplayer
         IEnumerator GotoReady()
         {
             yield return new WaitForSeconds(15f);
+#if UNITY_SERVER
+            Dedicated.DedicatedServer.ClearPlayers();
+#endif
             SetGameState(GameState.Voting, false);
             int playerCount = Server.ClientCount;
 
@@ -1332,7 +1364,7 @@ namespace Multiplayer
 
                 message.Add(_votingTime);
 
-                message.AddUShort(CurrentServer.OverrideMinimalPlayerCount(2));
+                message.AddUShort(CurrentServer.OverrideMinimalPlayerCount(MinimalPlayerCount));
 
                 message.Add((ushort)ClientData.Count);
 
@@ -1351,11 +1383,16 @@ namespace Multiplayer
 
         IEnumerator KickLoadFailedPlayer()
         {
+            // Only players who were here when the map loaded. Anyone who joins in the next
+            // 10 seconds is still loading it. Compared by reference because Riptide reuses ids.
+            var loading = ClientData.Values.ToList();
+
             yield return new WaitForSeconds(10);
 
-            foreach (var client in ClientData.Values.ToList())
+            foreach (var client in loading)
             {
-                if (!ServerPlayer.list.ContainsKey(client.Id))
+                if (ClientData.TryGetValue(client.Id, out var current) && current == client
+                    && !ServerPlayer.list.ContainsKey(client.Id))
                 {
                     Server.DisconnectClient(client.Id);
                 }
@@ -1413,68 +1450,21 @@ namespace Multiplayer
                 }
                 else
                 {
-                    List<LagCompensationHitbox> hitboxes = new List<LagCompensationHitbox>();
-                    //Player hitbox
-                    foreach (var serverPlayer in ServerPlayer.list.Values)
+                    float range = 1000f, spread = 0f;
+                    if (fromPlayer.IsInfected || weapon.Stat.weaponType == WeaponStat.WeaponType.Knife) range = 4f;
+                    else if (weapon.Stat.weaponType == WeaponStat.WeaponType.Taser) range = 6f;
+                    else
                     {
-                        TransformUpdate transformUpdate = serverPlayer.TransformBuffer[finalTick % ServerPlayer.MaxTickStore];
-
-                        if (transformUpdate != null)
-                        {
-                            Vector3 predictPos = transformUpdate.Position;
-
-                            if (ShouldSpawnHitbox(serverPlayer, fromPlayer))
-                            {
-                                LagCompensationHitbox hitbox = ObjectPooler.Instance.SpawnFromPool("PlayerHitbox", predictPos, Quaternion.identity).GetComponent<LagCompensationHitbox>();
-
-                                hitbox.Initialize(serverPlayer.Id, finalTick);
-
-                                hitboxes.Add(hitbox);
-                            }
-                        }
+                        // Pellets go along lookDir + offset with |offset| <= s; the widest one is tangent to that
+                        // sphere, so its slope off lookDir is s / sqrt(|lookDir|^2 - s^2). Past that, don't cull.
+                        float s = weapon.Stat.spreadAngle / 80f;
+                        float d = lookDir.sqrMagnitude - s * s;
+                        spread = d > 0.0001f ? s / Mathf.Sqrt(d) : float.PositiveInfinity;
                     }
 
-                    //Enemy Hitbox
-                    foreach (var serverEnemy in ServerEnemy.list.Values)
-                    {
-                        TransformUpdate transformUpdate = serverEnemy.TransformBuffer[finalTick % ServerPlayer.MaxTickStore];
+                    SpawnHitboxes(finalTick, finalTick, fromPlayer, raycastPos, lookDir.normalized, range, spread, 0f);
 
-                        if (transformUpdate != null)
-                        {
-                            Vector3 predictPos = transformUpdate.Position;
-
-                            string enemy;
-
-                            switch (serverEnemy.enemyType)
-                            {
-                                case ServerEnemy.EnemyType.Jack:
-                                    enemy = "JackHitbox";
-                                    break;
-                                case ServerEnemy.EnemyType.Kat:
-                                    enemy = "KatHitbox";
-                                    break;
-                                case ServerEnemy.EnemyType.Turret:
-                                    enemy = "TurretHitbox";
-                                    break;
-                                case ServerEnemy.EnemyType.Zombie:
-                                    enemy = "ZombieHitbox";
-                                    break;
-                                default:
-                                    enemy = "JackHitbox";
-                                    break;
-                            }
-
-                            LagCompensationHitbox hitbox = ObjectPooler.Instance.SpawnFromPool(enemy, predictPos, Quaternion.identity).GetComponent<LagCompensationHitbox>();
-
-                            hitbox.Initialize(serverEnemy.Id, finalTick);
-
-                            hitboxes.Add(hitbox);
-                        }
-                    }
-
-                    Physics.SyncTransforms();
-
-                    RaycastHit[] hits = new RaycastHit[10];
+                    RaycastHit[] hits = Hits;
                     Vector3 dir;
                     int cnt;
 
@@ -1597,8 +1587,8 @@ namespace Multiplayer
 
                                     // Debug.Log($"Client tick: {tick} , Server tick: {CurrentTick} , Raycast Pos: {raycastPos}");
 
-                                    Dictionary<GameObject, RaycastHit> objToHits =
-                                        new Dictionary<GameObject, RaycastHit>();
+                                    Dictionary<GameObject, RaycastHit> objToHits = ObjToHits;
+                                    objToHits.Clear();
 
                                     for (int j = 0; j < cnt; j++)
                                     {
@@ -1611,7 +1601,7 @@ namespace Multiplayer
                                         if (hitbox != null)
                                         {
                                             Vector3 hitboxPos = hitbox.transform.position;
-                                            RaycastHit[] wallHits = new RaycastHit[10];
+                                            RaycastHit[] wallHits = WallHits;
 
                                             int wallCnt = Physics.RaycastNonAlloc(hitboxPos, (raycastPos - hitboxPos).normalized,
                                                 wallHits, Vector3.Distance(hitboxPos, raycastPos),
@@ -1654,12 +1644,7 @@ namespace Multiplayer
                         }
                     }
 
-                    foreach (var hitbox in hitboxes)
-                    {
-                        hitbox.gameObject.SetActive(false);
-                    }
-
-                    hitboxes.Clear();
+                    DespawnHitboxes();
                 }
             }
 
@@ -1667,7 +1652,6 @@ namespace Multiplayer
 
         IEnumerator ExplosiveAmmoLagCompensation(uint tick, Vector3 startPos, Vector3 dir, ushort fromClient, int useGravity, IPlayerServer fromPlayer)
         {
-            List<LagCompensationHitbox> hitboxes = new List<LagCompensationHitbox>();
             bool aiming = fromPlayer.IsAiming;
 
             Vector3 startVel = dir * 200f;
@@ -1676,7 +1660,8 @@ namespace Multiplayer
 
             uint predictTick = tick;
 
-            for (float t = 0; t < 50; t += Time.fixedDeltaTime)
+            // ponytail: 4 m steps can tunnel through thin walls; sweep with SphereCast if that shows up in play.
+            for (float t = 0; t < MaxExplosiveFlightTime; t += Time.fixedDeltaTime)
             {
                 Vector3 newPoint = startPos + t * startVel;
                 newPoint.y = startPos.y + startVel.y * t + Physics.gravity.y / 2f * t * t * useGravity;
@@ -1690,67 +1675,9 @@ namespace Multiplayer
 
                     predictTick += (uint)(t / 0.02f);
 
-                    //Player hitbox
-                    foreach (var serverPlayer in ServerPlayer.list.Values)
-                    {
-                        TransformUpdate transformUpdate = serverPlayer.TransformBuffer[predictTick % ServerPlayer.MaxTickStore];
+                    SpawnHitboxes(predictTick, tick, fromPlayer, newPoint, Vector3.zero, 0f, 0f, ExplosionRadius);
 
-                        if (transformUpdate != null)
-                        {
-                            Vector3 predictPos = transformUpdate.Position;
-
-                            if (ShouldSpawnHitbox(serverPlayer, fromPlayer))
-                            {
-                                LagCompensationHitbox hitbox = ObjectPooler.Instance.SpawnFromPool("PlayerHitbox", predictPos, Quaternion.identity).GetComponent<LagCompensationHitbox>();
-
-                                hitbox.Initialize(serverPlayer.Id, tick);
-
-                                hitboxes.Add(hitbox);
-                            }
-                        }
-                    }
-
-                    //Enemy Hitbox
-                    foreach (var serverEnemy in ServerEnemy.list.Values)
-                    {
-                        TransformUpdate transformUpdate = serverEnemy.TransformBuffer[predictTick % ServerPlayer.MaxTickStore];
-
-                        if (transformUpdate != null)
-                        {
-                            Vector3 predictPos = transformUpdate.Position;
-
-                            string enemy;
-
-                            switch (serverEnemy.enemyType)
-                            {
-                                case ServerEnemy.EnemyType.Jack:
-                                    enemy = "JackHitbox";
-                                    break;
-                                case ServerEnemy.EnemyType.Kat:
-                                    enemy = "KatHitbox";
-                                    break;
-                                case ServerEnemy.EnemyType.Turret:
-                                    enemy = "TurretHitbox";
-                                    break;
-                                case ServerEnemy.EnemyType.Zombie:
-                                    enemy = "ZombieHitbox";
-                                    break;
-                                default:
-                                    enemy = "JackHitbox";
-                                    break;
-                            }
-
-                            LagCompensationHitbox hitbox = ObjectPooler.Instance.SpawnFromPool(enemy, predictPos, Quaternion.identity).GetComponent<LagCompensationHitbox>();
-
-                            hitbox.Initialize(serverEnemy.Id, tick);
-
-                            hitboxes.Add(hitbox);
-                        }
-                    }
-
-                    Physics.SyncTransforms();
-
-                    cnt = Physics.OverlapSphereNonAlloc(newPoint, 18f, cols, GameManager.Instance.lagCompensationHitboxLayer, QueryTriggerInteraction.Ignore);
+                    cnt = Physics.OverlapSphereNonAlloc(newPoint, ExplosionRadius, cols, GameManager.Instance.lagCompensationHitboxLayer, QueryTriggerInteraction.Ignore);
 
                     HashSet<ushort> alreadyHitted = new HashSet<ushort>();
 
@@ -1762,16 +1689,92 @@ namespace Multiplayer
                         }
                     }
 
-                    foreach (var hitbox in hitboxes)
-                    {
-                        hitbox.gameObject.SetActive(false);
-                    }
-
-                    hitboxes.Clear();
+                    DespawnHitboxes();
 
                     yield break;
                 }
             }
+        }
+
+        // Rewound hitboxes are only placed near the shot. Toggling a collider on/off is the expensive part,
+        // and doing it for every player and enemy on every shot was most of the server's physics cost.
+        private const float PlayerCullMargin = 5f;
+        // ponytail: generous because enemy hitbox sizes vary; measure the largest one to tighten it.
+        private const float EnemyCullMargin = 12f;
+        private const float ExplosionRadius = 18f;
+        private const float MaxExplosiveFlightTime = 5f;
+
+        private static readonly List<LagCompensationHitbox> SpawnedHitboxes = new();
+        private static readonly RaycastHit[] Hits = new RaycastHit[10];
+        private static readonly RaycastHit[] WallHits = new RaycastHit[10];
+        private static readonly Dictionary<GameObject, RaycastHit> ObjToHits = new();
+
+        /// <summary>Distance from <paramref name="position"/> to the shot segment, widened by spread, within margin.</summary>
+        static bool NearShot(Vector3 position, Vector3 origin, Vector3 dir, float range, float spread, float margin)
+        {
+            if (float.IsPositiveInfinity(spread)) return true;
+
+            Vector3 toTarget = position - origin;
+            float along = Mathf.Clamp(Vector3.Dot(toTarget, dir), 0f, range);
+            float radius = margin + along * spread;
+            return (toTarget - dir * along).sqrMagnitude <= radius * radius;
+        }
+
+        void SpawnHitboxes(uint bufferTick, uint hitboxTick, IPlayerServer fromPlayer, Vector3 origin, Vector3 dir, float range, float spread, float extraMargin)
+        {
+            foreach (var serverPlayer in ServerPlayer.list.Values)
+            {
+                TransformUpdate transformUpdate = serverPlayer.TransformBuffer[bufferTick % ServerPlayer.MaxTickStore];
+
+                if (transformUpdate == null || !ShouldSpawnHitbox(serverPlayer, fromPlayer) ||
+                    !NearShot(transformUpdate.Position, origin, dir, range, spread, PlayerCullMargin + extraMargin))
+                    continue;
+
+                LagCompensationHitbox hitbox = ObjectPooler.Instance.SpawnFromPool("PlayerHitbox", transformUpdate.Position, Quaternion.identity).GetComponent<LagCompensationHitbox>();
+                hitbox.Initialize(serverPlayer.Id, hitboxTick);
+                SpawnedHitboxes.Add(hitbox);
+            }
+
+            foreach (var serverEnemy in ServerEnemy.list.Values)
+            {
+                TransformUpdate transformUpdate = serverEnemy.TransformBuffer[bufferTick % ServerPlayer.MaxTickStore];
+
+                if (transformUpdate == null ||
+                    !NearShot(transformUpdate.Position, origin, dir, range, spread, EnemyCullMargin + extraMargin))
+                    continue;
+
+                string enemy;
+
+                switch (serverEnemy.enemyType)
+                {
+                    case ServerEnemy.EnemyType.Kat:
+                        enemy = "KatHitbox";
+                        break;
+                    case ServerEnemy.EnemyType.Turret:
+                        enemy = "TurretHitbox";
+                        break;
+                    case ServerEnemy.EnemyType.Zombie:
+                        enemy = "ZombieHitbox";
+                        break;
+                    default:
+                        enemy = "JackHitbox";
+                        break;
+                }
+
+                LagCompensationHitbox hitbox = ObjectPooler.Instance.SpawnFromPool(enemy, transformUpdate.Position, Quaternion.identity).GetComponent<LagCompensationHitbox>();
+                hitbox.Initialize(serverEnemy.Id, hitboxTick);
+                SpawnedHitboxes.Add(hitbox);
+            }
+
+            Physics.SyncTransforms();
+        }
+
+        static void DespawnHitboxes()
+        {
+            foreach (var hitbox in SpawnedHitboxes)
+                hitbox.gameObject.SetActive(false);
+
+            SpawnedHitboxes.Clear();
         }
 
         public bool ShouldSpawnHitbox(IPlayerServer serverPlayer, IPlayer fromPlayer)
