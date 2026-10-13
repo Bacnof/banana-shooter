@@ -610,6 +610,123 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
         {
 
         }
+
+        public void LogInfo()
+        {
+            var msg = new StringBuilder();
+
+            static int Count<T>(List<T> list) => list?.Count ?? 0;
+
+            int meshCount = Count(meshDatas);
+            int lightCount = Count(lightDatas);
+            int spawnCount = Count(spawnPos);
+            int decalCount = Count(decalDatas);
+            int decorationCount = Count(decorationDatas);
+            int audioCount = Count(audioDatas);
+            int totalCount = meshCount + lightCount + spawnCount + decalCount + decorationCount + audioCount;
+
+            int externalMaterialCount = Count(externalMaterials);
+            int externalDecalCount = Count(externalDecalDatas);
+            int externalAudioCount = Count(externalAudioDatas);
+
+            string ambient = ambientColor == null
+                ? "null"
+                : $"({ambientColor.r}, {ambientColor.g}, {ambientColor.b})";
+            string size = bound == null ? "null" : bound.ToVector3().ToString();
+            string center = boundCenter == null ? "null" : boundCenter.ToVector3().ToString();
+
+            msg.AppendLine($"[MapData] \"{name}\" version {version} saveKey {saveKey} fileId {fileId} published {isPublished}");
+            msg.AppendLine($"  path: {path}");
+            msg.AppendLine($"  description: {description}");
+            msg.AppendLine($"  environment: skyboxIndex {skyboxIndex}, useDirectionalLight {useDirectionalLight}, ambientColor {ambient}");
+            msg.AppendLine($"  bound: size {size}, center {center}");
+            msg.AppendLine($"  objects ({totalCount}): mesh {meshCount}, light {lightCount}, spawn {spawnCount}, decal {decalCount}, decoration {decorationCount}, audio {audioCount}");
+            msg.AppendLine($"  external assets: material {externalMaterialCount}, decal {externalDecalCount}, audio {externalAudioCount}");
+
+            var issues = new StringBuilder();
+
+            for (int i = 0; i < meshCount; i++)
+            {
+                var mesh = meshDatas[i];
+                if (mesh == null)
+                {
+                    issues.AppendLine($"  ! mesh[{i}] is null");
+                    continue;
+                }
+
+                if (mesh.data == null)
+                    issues.AppendLine($"  ! mesh[{i}] has no data");
+
+                if (mesh.materialIndexes == null)
+                {
+                    issues.AppendLine($"  ! mesh[{i}] \"{mesh.data?.name}\" has no materialIndexes");
+                    continue;
+                }
+
+                foreach (var materialIndex in mesh.materialIndexes)
+                {
+                    if (materialIndex == null || !materialIndex.isExternal) continue;
+
+                    if (materialIndex.index < 0 || materialIndex.index >= externalMaterialCount)
+                        issues.AppendLine($"  ! mesh[{i}] \"{mesh.data?.name}\" external material index {materialIndex.index} out of range ({externalMaterialCount} external materials)");
+                }
+            }
+
+            for (int i = 0; i < decalCount; i++)
+            {
+                var decal = decalDatas[i];
+                if (decal == null)
+                {
+                    issues.AppendLine($"  ! decal[{i}] is null");
+                    continue;
+                }
+
+                if (decal.data == null)
+                    issues.AppendLine($"  ! decal[{i}] has no data");
+
+                if (decal.external && (decal.materialIndex < 0 || decal.materialIndex >= externalDecalCount))
+                    issues.AppendLine($"  ! decal[{i}] \"{decal.data?.name}\" external decal material index {decal.materialIndex} out of range ({externalDecalCount} external decals)");
+            }
+
+            for (int i = 0; i < decorationCount; i++)
+            {
+                var decoration = decorationDatas[i];
+                if (decoration == null)
+                {
+                    issues.AppendLine($"  ! decoration[{i}] is null");
+                    continue;
+                }
+
+                if (decoration.data == null)
+                    issues.AppendLine($"  ! decoration[{i}] has no data");
+            }
+
+            for (int i = 0; i < audioCount; i++)
+            {
+                var audio = audioDatas[i];
+                if (audio == null)
+                {
+                    issues.AppendLine($"  ! audio[{i}] is null");
+                    continue;
+                }
+
+                if (audio.data == null)
+                    issues.AppendLine($"  ! audio[{i}] has no data");
+
+                if (audio.index < 0)
+                    issues.AppendLine($"  ! audio[{i}] \"{audio.data?.name}\" has no external audio index ({audio.index}), it will be skipped");
+                else if (audio.index >= externalAudioCount)
+                    issues.AppendLine($"  ! audio[{i}] \"{audio.data?.name}\" external audio index {audio.index} out of range ({externalAudioCount} external audio clips)");
+            }
+
+            if (issues.Length > 0)
+            {
+                msg.AppendLine("  issues:");
+                msg.Append(issues);
+            }
+
+            Debug.Log(msg.ToString());
+        }
     }
 
 
@@ -1049,12 +1166,20 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
             if (loadExternal)
             {
+                Debug.Log("Start loading external datas");
+
                 AssetBundleManager.Instance.UnloadAllBundles();
                 externalMaterials.Clear();
                 externalDecalMaterials.Clear();
                 externalAudioClips.Clear();
                 ModelConfigs.Clear();
 
+                Debug.Log("Cleaned up previous external data");
+
+                var mipChain = true;
+
+                // Async can cause it to never load, dont know why
+                var textureBasePath = data.GetTexturePath();
                 foreach (var externalMaterial in data.externalMaterials)
                 {
                     Material material = new Material(dummyMat);
@@ -1065,26 +1190,28 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                     material.SetFloat(Smoothness, externalMaterial.smoothness);
                     material.SetFloat(Metallic, externalMaterial.metallic);
 
-                    string p = data.GetTexturePath();
                     string n = externalMaterial.name;
 
                     material.name = n;
 
-                    string baseMap = $"{p}/{n}_base.png";
+                    string baseMap = $"{textureBasePath}/{n}_base.png";
                     if (File.Exists(baseMap))
                     {
-                        Texture2D texture2D = new Texture2D(512, 512, TextureFormat.RGB24, false);
-                        byte[] bytes = await SaveSystem.ReadByteFromFileAsync(baseMap);
+                        Texture2D texture2D = new Texture2D(512, 512, TextureFormat.RGB24, mipChain);
+
+                        // Async can cause it to never load, dont know why
+                        var bytes = SaveSystem.ReadByteFromFile(baseMap);
                         texture2D.LoadImage(bytes);
 
                         material.mainTexture = texture2D;
                     }
 
-                    string heightMap = $"{p}/{n}_height.png";
+                    string heightMap = $"{textureBasePath}/{n}_height.png";
                     if (File.Exists(heightMap))
                     {
-                        Texture2D texture2D = new Texture2D(512, 512, TextureFormat.RGB24, false);
-                        byte[] bytes = await SaveSystem.ReadByteFromFileAsync(heightMap);
+                        Texture2D texture2D = new Texture2D(512, 512, TextureFormat.RGB24, mipChain);
+
+                        byte[] bytes = SaveSystem.ReadByteFromFile(heightMap);
                         texture2D.LoadImage(bytes);
 
                         material.SetTexture(ParallaxMap, texture2D);
@@ -1093,11 +1220,12 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                     }
                     else material.SetTexture(ParallaxMap, null);
 
-                    string normalMap = $"{p}/{n}_normal.png";
+                    string normalMap = $"{textureBasePath}/{n}_normal.png";
                     if (File.Exists(normalMap))
                     {
-                        Texture2D texture2D = new Texture2D(512, 512, TextureFormat.RGB24, false);
-                        byte[] bytes = await SaveSystem.ReadByteFromFileAsync(normalMap);
+                        Texture2D texture2D = new Texture2D(512, 512, TextureFormat.RGB24, mipChain);
+
+                        byte[] bytes = SaveSystem.ReadByteFromFile(normalMap);
                         texture2D.LoadImage(bytes);
 
                         material.SetTexture(BumpMap, texture2D);
@@ -1112,6 +1240,8 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                     externalMaterials.Add(tuple);
                 }
 
+                Debug.Log($"Loaded external materials: {externalMaterials.Count}");
+
                 foreach (var decalData in data.externalDecalDatas)
                 {
                     Material material = new Material(decalDummyMat);
@@ -1124,8 +1254,9 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                     string baseMap = $"{p}/{n}_base.png";
                     if (File.Exists(baseMap))
                     {
-                        Texture2D texture2D = new Texture2D(1, 1, TextureFormat.RGB24, false);
-                        byte[] bytes = await SaveSystem.ReadByteFromFileAsync(baseMap);
+                        Texture2D texture2D = new Texture2D(1, 1, TextureFormat.RGB24, mipChain);
+
+                        byte[] bytes = SaveSystem.ReadByteFromFile(baseMap);
                         texture2D.LoadImage(bytes);
 
                         material.SetTexture(BaseMap, texture2D);
@@ -1134,33 +1265,30 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                     externalDecalMaterials.Add(new Tuple<string, Material>(baseMap, material));
                 }
 
+                Debug.Log($"Loaded external decals: {externalDecalMaterials.Count}");
+
                 foreach (var audioData in data.externalAudioDatas)
                 {
                     string p = data.GetAudioPath();
                     string n = audioData.name;
-                    Debug.Log(n);
+                    // Debug.Log(n);
 
                     string audioPath = FindFile(p, $"{n}.wav");
-                    // Debug.Log(audioPath + "Path exist: " + File.Exists(audioPath));
-                    if (File.Exists(audioPath))
+                    if (!File.Exists(audioPath))
+                        audioPath = FindFile(p, $"{n}.mp3");
+
+                    AudioClip clip = File.Exists(audioPath) ? await LoadAudio(audioPath) : null;
+                    if (clip == null)
                     {
-                        AudioClip clip = await LoadAudio(audioPath);
-                        clip.name = n;
-
-                        externalAudioClips.Add(new Tuple<string, AudioClip>(audioPath, clip));
-                        continue;
+                        Debug.LogWarning($"Failed to load audio {audioPath}");
+                        clip = AudioClip.Create(n, 1, 1, 44100, false);
                     }
+                    clip.name = n;
 
-                    audioPath = FindFile(p, $"{n}.mp3");
-                    // Debug.Log(audioPath + "Path exist: " + File.Exists(audioPath));
-                    if (File.Exists(audioPath))
-                    {
-                        AudioClip clip = await LoadAudio(audioPath);
-                        clip.name = n;
-
-                        externalAudioClips.Add(new Tuple<string, AudioClip>(audioPath, clip));
-                    }
+                    externalAudioClips.Add(new Tuple<string, AudioClip>(audioPath, clip));
                 }
+
+                Debug.Log($"Loaded external audios: {externalAudioClips.Count}");
 
                 if (Directory.Exists(data.GetModelPath()))
                 {
@@ -1175,22 +1303,38 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                         string sourcePath = Path.Combine(info.FullName, "source.unity3d");
                         if (File.Exists(configPath))
                         {
-                            MapData.ExternalModelConfig config =
-                                JsonConvert.DeserializeObject<MapData.ExternalModelConfig>(
-                                    SaveSystem.ReadFileNormally(configPath));
-
-                            if (File.Exists(previewImage))
-                                config.previewImage.LoadImage(await SaveSystem.ReadByteFromFileAsync(previewImage));
-
-                            if (File.Exists(sourcePath))
+                            try
                             {
-                                await TryToDownloadAssetBundle(config, sourcePath);
+                                MapData.ExternalModelConfig config =
+                                    JsonConvert.DeserializeObject<MapData.ExternalModelConfig>(
+                                        SaveSystem.ReadFileNormally(configPath));
+
+                                if (config == null || string.IsNullOrEmpty(config.name) || ModelConfigs.ContainsKey(config.name))
+                                {
+                                    Debug.LogWarning($"Skipping model config {configPath}");
+                                    continue;
+                                }
+
+                                if (File.Exists(previewImage))
+                                    config.previewImage.LoadImage(await SaveSystem.ReadByteFromFileAsync(previewImage));
+
+                                if (File.Exists(sourcePath))
+                                {
+                                    await TryToDownloadAssetBundle(config, sourcePath);
+                                }
+                                ModelConfigs.Add(config.name, config);
                             }
-                            ModelConfigs.Add(config.name, config);
+                            catch (Exception e)
+                            {
+                                Debug.LogError($"Failed to load model {info.Name}: {e}");
+                            }
                         }
                     }
                 }
+                Debug.Log($"Loaded external models: {ModelConfigs.Count}");
             }
+
+            Debug.Log("Initialized workshop map load");
         }
 
         async Task TryToDownloadAssetBundle(MapData.ExternalModelConfig bundle, string p)
@@ -1210,7 +1354,7 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
                 if (loadedAssetBundle == null)
                 {
-                    Debug.Log($"Failed to load {bundle.name} AssetBundle!");
+                    Debug.LogError($"Failed to load {bundle.name} AssetBundle!");
                     return;
                 }
 
@@ -1223,14 +1367,63 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
                 if (assetRequest.asset is not GameObject go)
                 {
-                    Debug.Log($"Failed to load {bundle.name} Asset!");
+                    Debug.LogError($"Failed to load {bundle.name} Asset!");
                     return;
                 }
 
                 Sanitize(go);
+                UseGameShaders(go);
 
                 bundle.AssetBundle = AssetBundleManager.Instance.AddBundle(bundle.name, bundleRequest.assetBundle, assetRequest.asset);
             }
+        }
+
+        void UseGameShaders(GameObject root)
+        {
+            Shader lit = dummyMat != null ? dummyMat.shader : null;
+            if (lit == null) return;
+
+            var seen = new HashSet<Material>();
+            foreach (var r in root.GetComponentsInChildren<Renderer>(true))
+            {
+                foreach (var m in r.sharedMaterials)
+                {
+                    if (m == null || !seen.Add(m) || m.shader == lit) continue;
+
+                    string shaderName = m.shader != null ? m.shader.name : "null";
+                    bool supported = m.shader != null && m.shader.isSupported;
+                    bool broken = m.shader == null || !supported || shaderName == "Hidden/InternalErrorShader";
+
+                    if (shaderName == lit.name || (broken && IsLitFamily(m)))
+                    {
+                        Debug.Log($"[Workshop] {root.name}/{m.name}: {shaderName} supported={supported} -> {lit.name}");
+                        Texture mainTex = m.HasProperty(MainTex) ? m.GetTexture(MainTex) : null;
+                        m.shader = lit;
+                        if (m.GetTexture(LitBaseMap) == null && mainTex != null)
+                            m.SetTexture(LitBaseMap, mainTex);
+                    }
+                    else if (broken)
+                    {
+                        Debug.LogWarning($"[Workshop] {root.name}/{m.name}: {shaderName} supported={supported}, left as is");
+                    }
+                }
+            }
+        }
+
+        static readonly int MainTex = Shader.PropertyToID("_MainTex");
+        static readonly int LitBaseMap = Shader.PropertyToID("_BaseMap");
+
+        static readonly HashSet<string> LitShaders = new()
+        {
+            "Universal Render Pipeline/Lit", "Universal Render Pipeline/Simple Lit",
+            "Universal Render Pipeline/Complex Lit", "Universal Render Pipeline/Baked Lit",
+        };
+
+        static bool IsLitFamily(Material m)
+        {
+            if (m.shader != null && LitShaders.Contains(m.shader.name))
+                return true;
+            return m.HasProperty("_BaseMap") && m.HasProperty("_BaseColor") && m.HasProperty("_Metallic");
         }
 
         static readonly HashSet<Type> Allowed = new()
@@ -1262,7 +1455,8 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
             foreach (var external in externalAudioClips)
             {
-                Destroy(external.Item2);
+                if (external.Item2 != null)
+                    Destroy(external.Item2);
             }
 
             foreach (var external in externalDecalMaterials)
@@ -1477,8 +1671,10 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
             foreach (var decoration in data.decorationDatas)
             {
                 ObjectItem item = GetObjectItem(decoration.data.name);
-                var go = decoration.external ? AddObjectMenu.CreateDecorationExposeToEditor((GameObject)AssetBundleManager.Instance.GetAssetObject(decoration.data.name), MEBase.Instance.EditedObject.transform, decoration.data.position.ToVector3()
-                    , decoration.data.rotation, decoration.data.scale.ToVector3(), decoration.type, decoration.enableCollision) : AddObjectMenu.CreateDecorationExposeToEditor(item.prefab, MEBase.Instance.EditedObject.transform, decoration.data.position.ToVector3(),
+                GameObject prefab = GetDecorationPrefab(decoration);
+                if (prefab == null) continue;
+
+                var go = AddObjectMenu.CreateDecorationExposeToEditor(prefab, MEBase.Instance.EditedObject.transform, decoration.data.position.ToVector3(),
                     decoration.data.rotation, decoration.data.scale.ToVector3(), decoration.type, decoration.enableCollision);
 
                 GameObject o = go.gameObject;
@@ -1496,7 +1692,7 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
             foreach (var audioData in data.audioDatas)
             {
-                if (externalAudioClips.Count > audioData.index)
+                if (audioData.index >= 0 && audioData.index < externalAudioClips.Count)
                 {
                     ExposeToEditor go = AddExternalObjectMenu.CreateAudioSourceExposeToEditor(externalAudioClips[audioData.index].Item2);
 
@@ -1591,25 +1787,19 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
             foreach (var decoration in data.decorationDatas)
             {
-                GameObject go;
-                if (decoration.external)
-                {
-                    go = AddObjectMenu.CreateDecoration(
-                        (GameObject)AssetBundleManager.Instance.GetAssetObject(decoration.data.name), MEBase.Instance.PlayModeObject.transform, decoration.data.position.ToVector3(), decoration.data.rotation
-                        , decoration.data.scale.ToVector3(), decoration.type, decoration.enableCollision);
-                }
-                else
-                {
-                    ObjectItem item = GetObjectItem(decoration.data.name);
-                    go = AddObjectMenu.CreateDecoration(item.prefab, MEBase.Instance.PlayModeObject.transform, decoration.data.position.ToVector3(), decoration.data.rotation, decoration.data.scale.ToVector3(),
-                        decoration.type, decoration.enableCollision);
-                }
+                GameObject prefab = GetDecorationPrefab(decoration);
+                if (prefab == null) continue;
+
+                GameObject go = AddObjectMenu.CreateDecoration(prefab, MEBase.Instance.PlayModeObject.transform, decoration.data.position.ToVector3(), decoration.data.rotation, decoration.data.scale.ToVector3(),
+                    decoration.type, decoration.enableCollision);
 
                 playModeLoadedObject.Add(go);
             }
 
             foreach (var audioData in data.audioDatas)
             {
+                if (audioData.index < 0 || audioData.index >= externalAudioClips.Count) continue;
+
                 AudioSource source = AddExternalObjectMenu.CreateAudioSource(externalAudioClips[audioData.index].Item2);
 
                 Transform transform1;
@@ -1643,10 +1833,12 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                 return false;
             }
 
+            data.LogInfo();
+
             CurrentMap = data;
 
             await InitializeLoad(true, true);
-            #region Object
+
             foreach (var objectData in CurrentMap.meshDatas)
             {
                 GameObject go = GenerateMesh(objectData);
@@ -1693,21 +1885,16 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
             foreach (var decoration in CurrentMap.decorationDatas)
             {
-                if (decoration.external)
-                {
-                    AddObjectMenu.CreateDecoration(
-                        (GameObject)AssetBundleManager.Instance.GetAssetObject(decoration.data.name), MEMap.Instance.GetGroundRoot(), decoration.data.position.ToVector3(), decoration.data.rotation, decoration.data.scale.ToVector3(),
-                        decoration.type, decoration.enableCollision);
-                }
-                else
-                {
-                    ObjectItem item = GetObjectItem(decoration.data.name);
-                    AddObjectMenu.CreateDecoration(item.prefab, MEMap.Instance.GetGroundRoot(), decoration.data.position.ToVector3(), decoration.data.rotation, decoration.data.scale.ToVector3(),
-                        decoration.type, decoration.enableCollision);
-                }
+                GameObject prefab = GetDecorationPrefab(decoration);
+                if (prefab == null) continue;
+
+                AddObjectMenu.CreateDecoration(prefab, MEMap.Instance.GetGroundRoot(), decoration.data.position.ToVector3(), decoration.data.rotation, decoration.data.scale.ToVector3(),
+                    decoration.type, decoration.enableCollision);
             }
             foreach (var audioData in CurrentMap.audioDatas)
             {
+                if (audioData.index < 0 || audioData.index >= externalAudioClips.Count) continue;
+
                 AudioSource source = AddExternalObjectMenu.CreateAudioSource(externalAudioClips[audioData.index].Item2);
 
                 Transform transform1;
@@ -1725,10 +1912,22 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
                 source.Play();
             }
-            #endregion
 
             return true;
         }
+
+        GameObject GetDecorationPrefab(MapData.DecorationObjectData decoration)
+        {
+            GameObject prefab = decoration.external
+                ? AssetBundleManager.Instance.GetAssetObject(decoration.data.name) as GameObject
+                : GetObjectItem(decoration.data.name)?.prefab;
+
+            if (prefab == null)
+                Debug.LogWarning($"Skipping decoration {decoration.data.name}, its prefab didnt load");
+
+            return prefab;
+        }
+
         ObjectItem GetObjectItem(string n)
         {
             foreach (var item in objectItems)
