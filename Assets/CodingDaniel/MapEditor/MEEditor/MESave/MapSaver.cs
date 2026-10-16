@@ -1303,25 +1303,35 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                         string sourcePath = Path.Combine(info.FullName, "source.unity3d");
                         if (File.Exists(configPath))
                         {
+                            MapData.ExternalModelConfig config = null;
                             try
                             {
-                                MapData.ExternalModelConfig config =
-                                    JsonConvert.DeserializeObject<MapData.ExternalModelConfig>(
-                                        SaveSystem.ReadFileNormally(configPath));
+                                config = JsonConvert.DeserializeObject<MapData.ExternalModelConfig>(File.ReadAllText(configPath));
+                            }
+                            catch (Exception e)
+                            {
+                                Debug.LogError($"Failed to load external model config: {e}");
+                                continue;
+                            }
 
-                                if (config == null || string.IsNullOrEmpty(config.name) || ModelConfigs.ContainsKey(config.name))
-                                {
-                                    Debug.LogWarning($"Skipping model config {configPath}");
-                                    continue;
-                                }
+                            if (config == null || string.IsNullOrEmpty(config.name) || ModelConfigs.ContainsKey(config.name))
+                            {
+                                Debug.LogWarning($"Skipping model config {configPath}");
+                                continue;
+                            }
 
+                            try
+                            {
                                 if (File.Exists(previewImage))
-                                    config.previewImage.LoadImage(await SaveSystem.ReadByteFromFileAsync(previewImage));
+                                {
+                                    config.previewImage.LoadImage(SaveSystem.ReadByteFromFile(previewImage));
+                                }
 
                                 if (File.Exists(sourcePath))
                                 {
                                     await TryToDownloadAssetBundle(config, sourcePath);
                                 }
+
                                 ModelConfigs.Add(config.name, config);
                             }
                             catch (Exception e)
@@ -1343,14 +1353,9 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
 
             if (container == null)
             {
-                var bundleRequest = AssetBundle.LoadFromFileAsync(p);
+                Debug.Log($"Try to load asset bundle {p}");
 
-                while (!bundleRequest.isDone)
-                {
-                    await Task.Delay(10);
-                }
-
-                var loadedAssetBundle = bundleRequest.assetBundle;
+                var loadedAssetBundle = await AssetBundle.LoadFromFileAsync(p).AsTask();
 
                 if (loadedAssetBundle == null)
                 {
@@ -1358,23 +1363,29 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
                     return;
                 }
 
-                var assetRequest = loadedAssetBundle.LoadAssetAsync<GameObject>("model");
+                Debug.Log("Asset bundle loaded successfully");
 
-                while (!assetRequest.isDone)
-                {
-                    await Task.Delay(10);
-                }
+                Debug.Log("Try to load `model` from the asset bundle");
 
-                if (assetRequest.asset is not GameObject go)
+                var asset = await loadedAssetBundle.LoadAssetAsync<GameObject>("model").AsTask();
+
+                if (asset is not GameObject go)
                 {
+                    loadedAssetBundle.Unload(true);
                     Debug.LogError($"Failed to load {bundle.name} Asset!");
                     return;
                 }
 
+                Debug.Log("`model` loaded successfully");
+
+                Debug.Log("Sanitizing `model`");
+
                 Sanitize(go);
                 UseGameShaders(go);
 
-                bundle.AssetBundle = AssetBundleManager.Instance.AddBundle(bundle.name, bundleRequest.assetBundle, assetRequest.asset);
+                bundle.AssetBundle = AssetBundleManager.Instance.AddBundle(bundle.name, loadedAssetBundle, go);
+
+                Debug.Log($"Finished loading and processing asset bundle `{bundle.name}`");
             }
         }
 
@@ -1576,10 +1587,11 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
             #endregion
 
             var task = InitializeLoad(true, false);
-
-            while (!task.IsCompleted)
+            yield return new WaitUntil(() => task.IsCompleted);
+            if (task.Exception != null)
             {
-                yield return null;
+                Debug.LogError($"Failed to load map: {task.Exception}");
+                yield break;
             }
 
             OnMapLoaded?.Invoke();
@@ -2011,5 +2023,22 @@ namespace CodingDaniel.MapEditor.MEEditor.MESave
             return -1;
         }
 
+    }
+}
+
+public static class AsyncOperationExtensions
+{
+    public static Task<AssetBundle> AsTask(this AssetBundleCreateRequest request)
+    {
+        var tcs = new TaskCompletionSource<AssetBundle>();
+        request.completed += _ => tcs.SetResult(request.assetBundle);
+        return tcs.Task;
+    }
+
+    public static Task<UnityEngine.Object> AsTask(this AssetBundleRequest request)
+    {
+        var tcs = new TaskCompletionSource<UnityEngine.Object>();
+        request.completed += _ => tcs.SetResult(request.asset);
+        return tcs.Task;
     }
 }
