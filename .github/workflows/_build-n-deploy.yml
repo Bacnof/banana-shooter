@@ -1,8 +1,14 @@
 # This is intended as an automation for deploying updates, but since it's using secrets everywhere, forked repos can't run this workflow
-
+name: Build and Deploy
 on:
   workflow_call:
     inputs:
+      linux_os:
+        required: true
+        type: string
+      windows_os:
+        required: true
+        type: string
       # 'nightly' or 'semantic'
       version_scheme:
         required: true
@@ -22,16 +28,27 @@ on:
 
 jobs:
   build:
-    name: Build for ${{ matrix.targetPlatform }}
+    name: Build ${{ matrix.subtarget }} for ${{ matrix.targetPlatform }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          - os: windows-2022
+          - os: ${{ inputs.windows_os }}
             targetPlatform: StandaloneWindows64
-          - os: ubuntu-latest
+            subtarget: Client
+            buildName: Banana Shooter
+            cachePrefix: Library
+          - os: ${{ inputs.linux_os }}
             targetPlatform: StandaloneLinux64
+            subtarget: Client
+            buildName: Banana Shooter
+            cachePrefix: Library-Client
+          - os: ${{ inputs.linux_os }}
+            targetPlatform: StandaloneLinux64
+            subtarget: Server
+            buildName: bsds
+            cachePrefix: Library-Server
 
     steps:
       - name: Free Disk Space (Ubuntu)
@@ -39,47 +56,6 @@ jobs:
         uses: jlumbroso/free-disk-space@v2
         with:
           tool-cache: false
-
-      - name: Install Banana Shooter Unlicensed Backup CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            ARCHIVE="bsubp-x86_64-pc-windows-msvc.zip"
-            EXPECTED_SHA256="19bf8213133082d28347c29472171e63af82857c84dd941d003c46fab30d3eb5"
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            ARCHIVE="bsubp-x86_64-apple-darwin.tar.gz"
-            EXPECTED_SHA256="3981a7e58b31dd10605b9bd5d11a671506829c72deb54aacd9ebda35fae0e78d"
-          else
-            ARCHIVE="bsubp-x86_64-unknown-linux-gnu.tar.gz"
-            EXPECTED_SHA256="2bac353ffe8630f995f5ba37283e57039bf4a10d73a5ea9d32a379107ff84b28"
-          fi
-
-          INSTALL_DIR="$HOME/.local/bin"
-          mkdir -p "$INSTALL_DIR"
-
-          curl -fsSL -o "$ARCHIVE" \
-            "https://github.com/Squalive/bsubp/releases/download/v1.1.0/$ARCHIVE"
-
-          echo "$EXPECTED_SHA256  $ARCHIVE" | sha256sum -c -
-
-          if [[ "$ARCHIVE" == *.zip ]]; then
-            7z x "$ARCHIVE" -o"$INSTALL_DIR" -y > /dev/null
-            rm "$ARCHIVE"
-          else
-            tar -xzf "$ARCHIVE" -C "$INSTALL_DIR"
-            rm "$ARCHIVE"
-          fi
-
-          chmod +x "$INSTALL_DIR"/bsubp* 2>/dev/null || true
-          ls -la "$INSTALL_DIR"
-
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cygpath -w "$INSTALL_DIR" >> "$GITHUB_PATH"
-          else
-            echo "$INSTALL_DIR" >> "$GITHUB_PATH"
-          fi
 
       # Checkout (without LFS)
       - name: Checkout Repository
@@ -120,6 +96,17 @@ jobs:
             echo "version=" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Cache library
+        uses: actions/cache@v4
+        with:
+          path: Library
+          key: ${{ matrix.cachePrefix }}-${{ matrix.targetPlatform }}-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            ${{ matrix.cachePrefix }}-${{ matrix.targetPlatform }}-
+            ${{ matrix.cachePrefix }}-
+
+      - uses: ./.github/actions/install-bsubp
+
       - name: Restore Unlicensed Assets
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -128,18 +115,8 @@ jobs:
         run: |
             bsubp restore 2026-10-13T09-37-48Z -c
 
-      - name: Cache library
-        uses: actions/cache@v4
-        with:
-          path: Library
-          key: Library-${{ matrix.targetPlatform }}-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
-          restore-keys: |
-            Library-${{ matrix.targetPlatform }}-
-            Library-
-
-      - name: Build Project
+      - name: Build
         uses: game-ci/unity-builder@v4
-        id: build
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
@@ -149,7 +126,8 @@ jobs:
           unityVersion: 2021.3.45f2
           versioning: ${{ steps.version.outputs.versioning }}
           version: ${{ steps.version.outputs.version }}
-          buildName: Banana Shooter
+          buildName: ${{ matrix.buildName }}
+          customParameters: ${{ matrix.subtarget == 'Server' && '-standaloneBuildSubtarget Server' || '' }}
 
       - name: Remove IL2CPP/Burst debug directories
         shell: bash
@@ -169,10 +147,10 @@ jobs:
           echo "Remaining build contents:"
           find build -maxdepth 2 -type d
 
-      - name: Upload Build Artifact
+      - name: Upload Build
         uses: actions/upload-artifact@v4
         with:
-          name: Build-${{ matrix.targetPlatform }}
+          name: ${{ matrix.subtarget }}-${{ matrix.targetPlatform }}
           path: build/${{ matrix.targetPlatform }}
           retention-days: 1
 
@@ -184,27 +162,45 @@ jobs:
       actions: write
 
     steps:
-    - name: Download Windows Build
+    - name: Download Windows Client
       uses: actions/download-artifact@v4
       with:
-        name: Build-StandaloneWindows64
-        path: build/StandaloneWindows64
+        name: Client-StandaloneWindows64
+        path: client/StandaloneWindows64
 
-    - name: Download Linux Build
+    - name: Download Linux Client
       uses: actions/download-artifact@v4
       with:
-        name: Build-StandaloneLinux64
-        path: build/StandaloneLinux64
+        name: Client-StandaloneLinux64
+        path: client/StandaloneLinux64
 
-    - name: Deploy to Steam
+    - name: Download Linux Server
+      uses: actions/download-artifact@v4
+      with:
+        name: Server-StandaloneLinux64
+        path: server/StandaloneLinux64
+
+    - name: Deploy Client to Steam
       uses: game-ci/steam-deploy@v3
       with:
         username: ${{ secrets.STEAM_USERNAME }}
         configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
         appId: 1949740
         buildDescription: ${{ inputs.build_description }}
-        rootPath: build
+        rootPath: client
         depot1Path: StandaloneWindows64
+        depot2Path: StandaloneLinux64
+        releaseBranch: nightly
+
+    - name: Deploy Server to Steam
+      uses: game-ci/steam-deploy@v3
+      with:
+        username: ${{ secrets.STEAM_USERNAME }}
+        configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
+        appId: 2406780
+        buildDescription: ${{ inputs.build_description }}
+        rootPath: server
+        # Windows is depot1 and will be removed in the future
         depot2Path: StandaloneLinux64
         releaseBranch: nightly
 

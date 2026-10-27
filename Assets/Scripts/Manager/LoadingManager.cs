@@ -563,19 +563,19 @@ namespace Manager
             desiredProgress = percent;
 
             asyncOperation.allowSceneActivation = true;
-            while (!asyncOperation.isDone)
-            {
-                yield return null;
-            }
+            yield return new WaitUntil(() => asyncOperation.isDone);
 
             progress.SetEntry("Load WorkshopMap");
             progress.RefreshString();
             var task = MapSaver.Instance.LoadWorkshopMap(map, data);
-
-            while (!task.IsCompleted)
+            yield return new WaitUntil(() => task.IsCompleted);
+            if (task.Exception != null)
             {
-                yield return null;
+                Debug.LogError($"Failed to load workshop map: {task.Exception}");
+                _networkManager.DisconnectClient();
+                yield break;
             }
+
             #endregion
 
             #region Waitting for server
@@ -806,19 +806,20 @@ namespace Manager
             desiredProgress = percent;
 
             asyncOperation.allowSceneActivation = true;
-            while (!asyncOperation.isDone)
-            {
-                yield return null;
-            }
+            yield return new WaitUntil(() => asyncOperation.isDone);
 
             progress.SetEntry("Load WorkshopMap");
             progress.RefreshString();
             var task = MapSaver.Instance.LoadWorkshopMap(map, data);
-
-            while (!task.IsCompleted)
+            yield return new WaitUntil(() => task.IsCompleted);
+            if (task.Exception != null)
             {
-                yield return null;
+                Debug.LogError($"Failed to load workshop map: {task.Exception}");
+                TransitionUI.Instance.ClearTransition();
+                isLoading = false;
+                yield break;
             }
+
             #endregion
 
             desiredProgress = 1f;

@@ -56,6 +56,7 @@ namespace Console
                 _inputManager ??= new InputManager();
                 _inputManager.Enable();
                 inputField.onValueChanged.AddListener(CheckInput);
+                inputField.onValidateInput += (text, index, c) => c == '`' ? '\0' : c;
 
 #if UNITY_EDITOR
                 Debug.unityLogger.logEnabled = true;

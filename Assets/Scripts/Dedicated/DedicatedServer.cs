@@ -54,6 +54,15 @@ namespace Dedicated
         Callback<SteamServerConnectFailure_t> _steamFailed;
         Callback<DownloadItemResult_t> _workshopDownloaded;
 
+        // The project logs a stack trace with every Debug.Log, which buries the server console.
+        // Errors and exceptions keep theirs.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        static void QuietLogs()
+        {
+            Application.SetStackTraceLogType(LogType.Log, StackTraceLogType.None);
+            Application.SetStackTraceLogType(LogType.Warning, StackTraceLogType.None);
+        }
+
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         static void Boot()
         {
@@ -156,10 +165,10 @@ namespace Dedicated
             return true;
         }
 
-        // The server browser reads these by position: server type; workshop; DLC only; description.
+        // The server browser reads these by position: server type; workshop; DLC only; description; protocol version.
         void SetGameTags()
         {
-            SteamGameServer.SetGameTags($"{(int)NetworkServerManager.ServerType};{(NetworkServerManager.ServerEnableWorkshop ? 1 : 0)};{(_config.Server.DlcOnly ? 1 : 0)};{_config.Browser.DescriptionShort}");
+            SteamGameServer.SetGameTags($"{(int)NetworkServerManager.ServerType};{(NetworkServerManager.ServerEnableWorkshop ? 1 : 0)};{(_config.Server.DlcOnly ? 1 : 0)};{_config.Browser.DescriptionShort};{NetworkProtocol.Version}");
         }
 
         IEnumerator DownloadWorkshopMaps()
@@ -284,7 +293,7 @@ namespace Dedicated
 
             yield return SceneManager.LoadSceneAsync("CustomMap");
             var build = MapSaver.Instance.LoadWorkshopMap(id, data);
-            yield return new WaitUntil(() => build.IsCompleted);
+            yield return new WaitUntil(() => build.IsCompleted || build.IsFaulted || build.IsCanceled);
         }
 
         /// <summary>On a listen server the host's scene reset does this when voting starts or a map loads.</summary>
